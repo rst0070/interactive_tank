@@ -1,0 +1,864 @@
+<html>
+    <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+        <title>Interactive Tank</title>
+    </head>
+<body>
+    <h1 align="center">Interactive Tank</h1>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://threejs.org/build/three.module.min.js",
+            "three/addons/": "https://threejs.org/examples/jsm/",
+            "wgpu-matrix": "https://wgpu-matrix.org/dist/2.x/wgpu-matrix.module.min.js"
+        }
+
+
+    }</script>
+    <script type="module">
+        import*as THREE from 'three'
+        import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
+        import {vec2, vec3, vec4, mat4, utils} from 'wgpu-matrix';
+
+        const id_group = 0;
+
+        const loc_uv = 1;
+        const loc_normal = 2;
+        const loc_position = 3;
+
+        const loc_inter_stage_normal = 1;
+        const loc_inter_stage_uv = 2;
+        const loc_inter_stage_position = 3;
+        const loc_inter_stage_light = 4;
+        const loc_inter_stage_halfway = 5;
+        const loc_inter_stage_view = 6;
+
+
+        const binding_matrices = 1;
+        const binding_camera_position = 2;
+        const binding_sampler = 3;
+        const binding_diffuse_texture = 4;
+        const binding_etc_texture = 5;
+        const binding_normal_texture = 6;
+
+        const format_depth_texture = 'depth24plus';
+
+        const url_tank  = "/resource/tank.glb";
+        const url_shell = "/resource/88mm_shell.glb";
+
+        const TANK = {
+            obj: undefined,
+            renderer: undefined,
+            position: vec3.create(0, 0, 0),
+            rotation_y: 0,
+            M: mat4.identity(),
+        }
+        const BARREL = {
+            obj: undefined,
+            renderer: undefined,
+            position: vec3.create(0, 0, 0),
+            rotation_z: 0,
+            M: mat4.identity(),
+        }
+        const TURRET = {
+            obj: undefined,
+            renderer: undefined,
+            position:vec3.create(0,0,0), 
+            rotation_y: 0,
+            M: mat4.identity(),
+        };
+        const SHELL = {
+            obj: undefined,
+            renderer: undefined,
+            M: mat4.identity(),
+        };
+        const SHELLS = [];
+        const TANK_TEXTURE = {
+            url_diffuse: "resource/textures/tank-color.jpg", 
+            url_etc: "resource/textures/tank-etc.png", 
+            url_normalmap: "resource/textures/tank-normal.png"
+        };
+        const SHELL_TEXTURE = {
+            url_diffuse: "resource/textures/shell-color.png", 
+            url_etc: "resource/textures/shell-etc.png", 
+            url_normalmap: "resource/textures/shell-normal.png" 
+        }
+
+        async function load_resources(device, preferredFormat) {
+            // 1. Load model objects
+            let loader = new GLTFLoader();
+            
+            let tank = await new Promise((res, rej) => {
+                    loader.load(url_tank, (model) => {res(model);}, null, (error) => {rej(error);});
+                });
+            tank = tank.scene.children[0].children[0];
+
+            let shell = await new Promise((res, rej) => {
+                    loader.load(url_shell, (model) => {res(model);}, null, (error) => {rej(error);});
+                });
+            shell = shell.scene.children[0].children[0].children[0].children[0].children[0];
+            
+            TANK.obj = tank.children[0];
+            TANK.position = vec3.create(TANK.obj.position.x, TANK.obj.position.y, TANK.obj.position.z);
+            
+            TURRET.obj = tank.children[1].children[1];
+            TURRET.position = vec3.create(TURRET.obj.position.x, TURRET.obj.position.y, TURRET.obj.position.z);
+            
+            BARREL.obj = tank.children[1].children[0].children[0];
+            BARREL.position = vec3.create(BARREL.obj.position.x, BARREL.obj.position.y, BARREL.obj.position.z);
+            
+            SHELL.obj = shell;
+
+            // 2. assign renderer
+            TANK.renderer = await get_obj_renderer(TANK.obj, TANK_TEXTURE.url_diffuse, TANK_TEXTURE.url_etc, TANK_TEXTURE.url_normalmap, device, preferredFormat);
+            TURRET.renderer = await get_obj_renderer(TURRET.obj,TANK_TEXTURE.url_diffuse, TANK_TEXTURE.url_etc, TANK_TEXTURE.url_normalmap, device, preferredFormat);
+            BARREL.renderer = await get_obj_renderer(BARREL.obj, TANK_TEXTURE.url_diffuse, TANK_TEXTURE.url_etc, TANK_TEXTURE.url_normalmap, device, preferredFormat);
+        }
+
+        async function main() {
+            const adapter = await navigator.gpu?.requestAdapter();
+            const device = await adapter?.requestDevice();
+            if(!device) {
+                throw Error("WebGPU not supported.");
+            }
+            const canvas = document.querySelector("#webgpu");
+            const context = canvas.getContext("webgpu");
+            const preferredFormat = navigator.gpu.getPreferredCanvasFormat();
+            context.configure({
+                device,
+                format: preferredFormat,
+            });
+            let canvasTexture = context.getCurrentTexture();
+
+            class UI {
+                static NONE = 0;
+                static ROTATING = 1;
+                static TRANSLATING = 2;
+                static mouseMove = UI.NONE;
+                static camera = {fovy:60, position:vec3.create(0,0,-3), near:0.1, far:100};
+                static matrices = {
+                    P: mat4.perspective(utils.degToRad(UI.camera.fovy), canvasTexture.width/canvasTexture.height, UI.camera.near, UI.camera.far),
+                    R: mat4.identity(),
+                };
+                static onmousedown(ev) {
+                    if(ev.buttons & 1)  { UI.mouseMove = UI.ROTATING; }
+                    else if(ev.buttons & 4) { UI.mouseMove = UI.TRANSLATING ; }
+                };
+                static onmouseup(ev) {
+                    UI.mouseMove = UI.NONE;
+                };
+                static onmousemove(ev) {
+                    let offset = [ev.movementX, ev.movementY];
+                    if (UI.mouseMove == UI.ROTATING) {
+                        UI.update_VP();
+                        let axis = unproject_vector([offset[1], offset[0], 0], UI.matrices.VP,
+                            [0, 0, canvas.clientWidth, canvas.clientHeight]);
+                        UI.matrices.R = mat4.rotate(UI.matrices.R, [axis[0], axis[1], axis[2]], utils.degToRad(vec2.lenSq(offset)*0.1)); 
+                    }
+                    else if(UI.mouseMove == UI.TRANSLATING) {
+                        UI.update_VP();
+                        let by = unproject_vector([offset[0], -offset[1], 0], UI.matrices.VP,
+                            [0, 0, canvas.clientWidth, canvas.clientHeight]);
+                        UI.camera.position = vec3.add(UI.camera.position, vec3.transformMat4(vec3.create(by[0], by[1], by[2]), UI.matrices.R));
+                    }
+                };
+                static onwheel(ev) {
+                    ev.preventDefault();
+                    UI.camera.position[2] = -Math.max(1, Math.min(-UI.camera.position[2] + ev.deltaY*0.01, 50));
+                    UI.update_VP();
+                };
+                static update_VP() {
+                    UI.matrices.VP = mat4.multiply(mat4.translate(UI.matrices.P, UI.camera.position),UI.matrices.R);
+                }
+                static async onkeydown(event){
+                    console.log(event.key);
+                    switch(event.key) {
+                        case 'ArrowLeft':
+                            TANK.rotation_y += 0.05;
+                            break;
+                        case 'ArrowRight':
+                            TANK.rotation_y -= 0.05;
+                            break;
+                        case 'ArrowUp':
+                            TANK.position[0] += 0.1 * Math.cos(TANK.rotation_y);
+                            TANK.position[2] += 0.1 * Math.sin(-TANK.rotation_y);
+                            break;
+                        case 'ArrowDown':
+                            TANK.position[0] +=  - 0.1 * Math.cos(TANK.rotation_y);
+                            TANK.position[2] +=  - 0.1 * Math.sin(-TANK.rotation_y);
+                            break;
+                        case 'a':
+                            TURRET.rotation_y += 0.05;
+                            break;
+                        case 'd':
+                            TURRET.rotation_y -= 0.05;
+                            break;
+                        case 'w': 
+                            BARREL.rotation_z += 0.05;
+                            BARREL.rotation_z = Math.min(0.4, BARREL.rotation_z);
+                            break;
+                        case 's':
+                            BARREL.rotation_z -= 0.05;
+                            BARREL.rotation_z = Math.max(-0.4, BARREL.rotation_z);
+                            break;
+                        case 'p':
+                            UI.update_M();
+
+                            let M = mat4.translate( BARREL.M, [ 0.5, 0.4, 0] );
+                            M = mat4.rotate(M, [0, 0, 1], 4.9);
+                            M = mat4.scale(M, [0.004, 0.004, 0.004]);
+
+                            let position = mat4.multiply(M, [0, 0, 0, 1]);
+                            SHELLS.push({
+                                renderer: await get_obj_renderer(SHELL.obj, SHELL_TEXTURE.url_diffuse, SHELL_TEXTURE.url_etc, SHELL_TEXTURE.url_normalmap, device, preferredFormat),
+                                M: M,
+                                position: vec3.create(position[0], position[1], position[2]),
+                            });
+                            
+                            break;
+                        default:
+                            break;
+                    }
+                    UI.update_M();
+                };
+                static update_M(){
+                    // Move TANK body
+                    TANK.M = mat4.identity();
+                    TANK.M = mat4.translate(TANK.M, [0, 0.5, 0]);
+                    TANK.M = mat4.translate(TANK.M, TANK.position);
+                    TANK.M = mat4.rotate(TANK.M, [0, 1, 0], TANK.rotation_y);
+                    // Move TURRET
+                    TURRET.M = mat4.translate(
+                            TANK.M, 
+                            [ -TURRET.position[0], -TURRET.position[1], -TURRET.position[2]]
+                        );
+                    TURRET.M = mat4.rotate(TURRET.M, [0, 1, 0], TURRET.rotation_y);
+                    TURRET.M = mat4.translate(TURRET.M, TURRET.position);
+                    // Move BARREL
+                    BARREL.M = mat4.translate(
+                            TURRET.M, 
+                            [ -BARREL.position[0], -BARREL.position[1], -BARREL.position[2]]
+                        );
+                    BARREL.M = mat4.rotate(BARREL.M, [0, 0, 1], BARREL.rotation_z);
+                    BARREL.M = mat4.translate(BARREL.M, BARREL.position);
+                }
+            };
+
+            await load_resources(device, preferredFormat);
+            UI.update_VP();
+            UI.update_M();
+
+
+            canvas.onmousedown = UI.onmousedown;
+            canvas.onmouseup = UI.onmouseup;
+            canvas.onmousemove = UI.onmousemove;
+            window.addEventListener("wheel", UI.onwheel, {passive:false});
+            window.addEventListener("keydown", UI.onkeydown);
+
+            const world_renderer = await get_world_renderer(device, preferredFormat);
+            const tank_axis_renderer = await get_tank_axis(device, preferredFormat);
+
+            const depthTexture = device.createTexture({
+                size: [canvasTexture.width, canvasTexture.height],
+                format: format_depth_texture,
+                usage: GPUTextureUsage.RENDER_ATTACHMENT,
+            });
+
+            async function render(time) {
+                
+
+                canvasTexture = context.getCurrentTexture();
+                    
+                const encoder = device.createCommandEncoder();
+                const renderPass = encoder.beginRenderPass({
+                    colorAttachments: [{
+                        view: canvasTexture.createView(),
+                        loadOp: "clear",
+                        clearValue: {r:.3, g:.3, b:.3, a:1},
+                        storeOp: "store",
+                    }],
+                    depthStencilAttachment: {
+                        view: depthTexture.createView(),
+                        depthClearValue: 1.0,
+                        depthLoadOp: 'clear',
+                        depthStoreOp: 'store',
+                    },
+                });
+
+                tank_axis_renderer.render(renderPass, mat4.multiply(UI.matrices.VP, mat4.translate(TANK.M, [0, -0.5, 0])));
+                TANK.renderer.render( renderPass, UI.matrices.VP, TANK.M, UI.camera.position );
+                TURRET.renderer.render( renderPass, UI.matrices.VP, TURRET.M, UI.camera.position );
+                BARREL.renderer.render( renderPass, UI.matrices.VP, BARREL.M, UI.camera.position );
+
+                // render shell
+                if(SHELLS.length > 0){
+                    for(let i = 0; i < SHELLS.length; i++){
+
+                        if(SHELLS[i].position[1] > 0){
+                            SHELLS[i].M = mat4.translate(SHELLS[i].M, [ 0.2, 5, 0]);
+                            SHELLS[i].M = mat4.rotate(SHELLS[i].M, [0, 0, 1], -0.004);
+                            SHELLS[i].position = mat4.multiply(SHELLS[i].M, [0, 0, 0, 1]);
+                        }
+
+                        SHELLS[i].renderer.render(
+                                renderPass,
+                                UI.matrices.VP,
+                                SHELLS[i].M,
+                                UI.camera.position
+                            );
+                    }
+                }
+                
+
+                world_renderer.render(renderPass, UI.matrices.VP);
+
+                renderPass.end();
+                const commandBuffer = encoder.finish();
+                device.queue.submit([commandBuffer]);
+
+                requestAnimationFrame(render);
+            }
+
+            requestAnimationFrame(render);
+
+        }
+
+        /*
+         * - Use tank-color.jpg and shell-color.png as the diffusive material property.
+         * – Use the red channel of tank-etc.png and shell-etc.png as the ambient occlusion value. You can apply this value by multiplying it to the computed diffusive reflection color.
+         * – Use the green channel of tank-etc.png and shell-etc.png as the ‘roughness’ property, which can be assigned to the ‘shininess’ property for the specular reflection color.
+         * – Use the blue channel of tank-etc.png and shell-etc.png as the ‘metalness’ property, which can be used as the specular reflection material property.
+         * – Use tank-normal.png and shell-normal.png as the normal map textures. Refer to normal_map for normal perturbation.
+         */
+
+        async function get_obj_renderer(
+            obj, 
+            url_diffuse, //diffusive
+            url_etc, // ambient occlusion, roughness, metalness
+            url_normalmap, // normal map
+            device, 
+            preferredFormat) {
+
+            const positions = obj.geometry.attributes.position.array;
+            const normals = obj.geometry.attributes.normal.array;
+            const indices = new Uint32Array(obj.geometry.index.array);
+            const uvs = obj.geometry.attributes.uv.array;
+
+            const vertexBuffer = {};
+
+            vertexBuffer.position = device.createBuffer({
+                    label:"obj mesh positions",
+                    size: positions.byteLength,
+                    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+                });
+
+            device.queue.writeBuffer(vertexBuffer.position, 0, positions);
+
+            vertexBuffer.normal = device.createBuffer({
+                    label:"obj mesh normals",
+                    size: normals.byteLength,
+                    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+                });
+
+            device.queue.writeBuffer(vertexBuffer.normal, 0, normals);
+
+            vertexBuffer.uv = device.createBuffer({
+                    label:"obj mesh uvs",
+                    size: uvs.byteLength,
+                    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+                });
+
+            device.queue.writeBuffer(vertexBuffer.uv, 0, uvs);
+
+            const indexBuffer = device.createBuffer({
+                label: `obj mesh indices`,
+                size: indices.byteLength,
+                usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+            });
+        
+            device.queue.writeBuffer(indexBuffer, 0, indices);
+
+            const loadTexture = async (url) => {
+                const response = await fetch(url);
+                const blob = await response.blob();
+                const bitmap = await createImageBitmap(blob, { colorSpaceConversion: "none" });
+                const texture = device.createTexture({
+                    label: url,
+                    format: "rgba8unorm",
+                    size: [bitmap.width, bitmap.height],
+                    usage:  GPUTextureUsage.TEXTURE_BINDING |
+                        GPUTextureUsage.COPY_DST |
+                        GPUTextureUsage.RENDER_ATTACHMENT |
+                        GPUTextureUsage.SAMPLED,
+                });
+                device.queue.copyExternalImageToTexture(
+                    { source: bitmap, flipY: false },
+                    { texture: texture },
+                    { width: bitmap.width, height: bitmap.height },
+                );
+                return texture;
+            };
+
+            const diffuseTexture = await loadTexture(url_diffuse);
+            const etcTexture = await loadTexture(url_etc);
+            const normalTexture = await loadTexture(url_normalmap);
+
+            const sampler = device.createSampler({ magFilter:"linear", minFilter:"linear",});
+            
+            const uniformBuffer = device.createBuffer({
+                size: 2*4*4*4,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+
+            const cameraPositionBuffer = device.createBuffer({
+                size: 4*4,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+
+            const shaderModule = device.createShaderModule({
+            label: "obj mesh rendering shader",
+            code: `
+            struct VertexOut {
+                @builtin(position) position: vec4f,
+                @location(${loc_inter_stage_normal}) normal: vec3f,
+                @location(${loc_inter_stage_uv}) uv: vec2f,
+                @location(${loc_inter_stage_position}) pos: vec3f,
+                @location(${loc_inter_stage_halfway}) halfway: vec3f,
+                @location(${loc_inter_stage_light}) light: vec3f,
+                @location(${loc_inter_stage_view}) view: vec3f
+            };
+
+            struct Matrices {
+                VP: mat4x4f,
+                M: mat4x4f,
+            };
+
+            struct Camera {
+                position: vec3f,
+                padding: f32,
+            };
+
+            const light_direction:vec3<f32> = vec3<f32>(1, 1, 1);
+            const light_intensity:f32 = 1.0;
+
+            @group(${id_group}) @binding(${binding_matrices}) var<uniform> matrices:Matrices;
+            @group(${id_group}) @binding(${binding_camera_position}) var<uniform> camera:Camera;
+            @group(${id_group}) @binding(${binding_sampler}) var my_sampler: sampler;
+            @group(${id_group}) @binding(${binding_diffuse_texture}) var diffuseTexture: texture_2d<f32>;
+            @group(${id_group}) @binding(${binding_etc_texture}) var etcTexture: texture_2d<f32>;
+            @group(${id_group}) @binding(${binding_normal_texture}) var normalTexture: texture_2d<f32>;
+
+            @vertex fn main_vert(
+                @location(${loc_uv}) uv: vec2f,
+                @location(${loc_normal}) normal: vec3f,
+                @location(${loc_position}) position: vec3f
+                )-> VertexOut {
+
+                var vertex: VertexOut;
+                vertex.position = matrices.VP * matrices.M * vec4f(position, 1);
+                vertex.normal = normalize((matrices.M * vec4f(normal, 1)).xyz);
+                vertex.uv = uv;
+                vertex.pos = position;
+
+                vertex.light = normalize(light_direction);
+
+                vertex.view = normalize(camera.position - position.xyz);
+                vertex.halfway = normalize(vertex.view + vertex.light);
+
+                return vertex;
+            }
+            @fragment fn main_frag(
+                @location(${loc_inter_stage_normal}) normal: vec3f, // normal vector
+                @location(${loc_inter_stage_uv}) uv: vec2f,
+                @location(${loc_inter_stage_position}) pos: vec3f,
+                @location(${loc_inter_stage_halfway}) halfway: vec3f,
+                @location(${loc_inter_stage_light}) light: vec3f,
+                @location(${loc_inter_stage_view}) view: vec3f
+                ) -> @location(0) vec4f {
+
+                // 1. perturbed normal
+                let norm = 2*(textureSample(normalTexture, my_sampler, uv).xyz - vec3f(.5));
+                let TBN = cotangent_frame(normal, -pos.xyz, uv);
+                let n = normalize(vec4(TBN*norm.xyz, 0)).xyz;
+                let perturbed_normal = 0.5*(n + vec3f(1));
+
+                // 2. compute the diffusive reflection color
+                let diffusive_material = textureSample(diffuseTexture, my_sampler, uv).rgb;
+                let etc = textureSample(etcTexture, my_sampler, uv).rgb;
+                let ambient_occlusion = etc.r; // apply this to multiply to the computed diffusive reflection color
+                let roughness = etc.g; //assigned to the shininess property for the specular reflection color
+                let metalness = etc.b; // use it as specular reflection material property
+
+                let diffuse = diffusive_material * dot( light, perturbed_normal ) * light_intensity;
+
+                let reflection = 2 * dot(light, perturbed_normal) * perturbed_normal - light;
+                let specular = metalness * pow(max(dot(reflection, view), 0.0), roughness) * light_intensity;
+
+                let color = diffuse * ambient_occlusion + specular;
+
+                return vec4(0.5 * (color), 1.0);
+            }
+
+            fn cotangent_frame(N: vec3f, p: vec3f, uv: vec2f) -> mat3x3f {
+                let dp1 = dpdx(p);
+                let dp2 = dpdy(p);
+                let duv1 = dpdx(uv);
+                let duv2 = dpdy(uv);
+
+                let dp2perp = cross(dp2, N);
+                let dp1perp = cross(N, dp1);
+                let T = dp2perp * duv1.x + dp1perp * duv2.x;
+                let B = dp2perp * duv1.y + dp1perp * duv2.y;
+
+                let invmax = inverseSqrt(max(dot(T,T), dot(B,B)));
+                return mat3x3f(T*invmax, B*invmax, N);
+            }
+            `
+            });
+
+            const bindGroupLayout = device.createBindGroupLayout({
+                entries:[
+                    {
+                        binding: binding_matrices,
+                        visibility: GPUShaderStage.VERTEX,
+                        buffer: {},
+                    },
+                    {
+                        binding: binding_camera_position,
+                        visibility: GPUShaderStage.VERTEX,
+                        buffer: {},
+                    },
+                    {
+                        binding: binding_sampler,
+                        visibility: GPUShaderStage.FRAGMENT,
+                        sampler: {},
+                    },
+                    {
+                        binding: binding_diffuse_texture,
+                        visibility: GPUShaderStage.FRAGMENT,
+                        texture: {},
+                    },
+                    {
+                        binding: binding_etc_texture,
+                        visibility: GPUShaderStage.FRAGMENT,
+                        texture: {},
+                    },
+                    {
+                        binding: binding_normal_texture,
+                        visibility: GPUShaderStage.FRAGMENT,
+                        texture: {},
+                    },
+                ]
+            });
+
+            const bindGroup = device.createBindGroup({
+                layout: bindGroupLayout,
+                entries:[
+                    { binding: binding_matrices, resource: {buffer: uniformBuffer} },
+                    { binding: binding_camera_position, resource: {buffer: cameraPositionBuffer} },
+                    { binding: binding_sampler, resource: sampler },
+                    { binding: binding_diffuse_texture, resource: diffuseTexture.createView() },
+                    { binding: binding_etc_texture, resource: etcTexture.createView() },
+                    { binding: binding_normal_texture, resource: normalTexture.createView() },
+                ],
+            });
+
+            const pipelineLayout = device.createPipelineLayout({
+                bindGroupLayouts:[
+                    bindGroupLayout
+                ]
+            });
+
+            const pipeline = device.createRenderPipeline({
+                label: "obj mesh rendering pipeline",
+                layout: pipelineLayout,
+                vertex: {
+                    module:shaderModule,
+                    entryPoint: "main_vert",
+                    buffers: [
+                        {
+                            arrayStride: 4*3,
+                            attributes: [{
+                            format: "float32x3",
+                            offset: 0,
+                            shaderLocation: loc_position,
+                            }],
+                        },
+                        {
+                            arrayStride: 4*3,
+                            attributes: [{
+                            format: "float32x3",
+                            offset: 0,
+                            shaderLocation: loc_normal,
+                            }],
+                        },
+                        {
+                            arrayStride: 4*2,
+                            attributes: [{
+                            format: "float32x2",
+                            offset: 0,
+                            shaderLocation: loc_uv,
+                            }],
+                        }
+                    ],
+                },
+                fragment: {
+                    module:shaderModule,
+                    entryPoint: "main_frag",
+                    targets: [{
+                    format: preferredFormat
+                    }]
+                },
+                primitive:{
+                    topology: 'triangle-list',
+                },
+                depthStencil: {
+                    depthWriteEnabled: true,
+                    depthCompare: 'less',
+                    format: format_depth_texture,
+                },
+            });
+
+            function render(renderPass, VP, M, camera_position) {
+                renderPass.setPipeline(pipeline);
+                renderPass.setBindGroup(id_group, bindGroup);
+
+                device.queue.writeBuffer(uniformBuffer, 0, VP);
+                device.queue.writeBuffer(uniformBuffer, 4*4*4, M);
+
+                device.queue.writeBuffer(
+                    cameraPositionBuffer, 
+                    0,
+                    new Float32Array([camera_position[0], camera_position[1], camera_position[2], 0])
+                    // 0 is for padding (webgpu require uniform buffer to have size of multiple of 16bytes)
+                );
+
+                renderPass.setVertexBuffer(0, vertexBuffer.position);
+                renderPass.setVertexBuffer(1, vertexBuffer.normal);
+                renderPass.setVertexBuffer(2, vertexBuffer.uv);
+                
+                renderPass.setIndexBuffer(indexBuffer, 'uint32');
+                renderPass.drawIndexed(obj.geometry.index.count);
+                
+            }
+
+            return {render};
+        }
+
+        async function get_tank_axis(device, preferredFormat){
+            const vertices = [
+                -2, 0, 0, 2, 0, 0,
+                0, -2, 0, 0, 2, 0,
+                0, 0, -2, 0, 0, 2,
+            ];
+            const colors = [
+                1, 0, 0, 1, 0, 0,
+                0, 1, 0, 0, 1, 0,
+                0, 0, 1, 0, 0, 1,
+            ];
+            return await get_vec_clr_renderer(vertices, colors, device, preferredFormat);
+        }
+
+        async function get_world_renderer(device, preferredFormat){
+
+            const vertices = [];
+            const colors = [];
+
+            {
+                for(let i = -10; i <= 10; i++){
+                    vertices.push(i, 0, -10, i, 0, 10); // grid line (i, 0, -10) -> (i, 0, 10) : parallel to z-axis
+                    vertices.push(-10, 0, i, 10, 0, i); // grid line (-10, 0, i) -> (10, 0, i) : parallel to x-axis
+                    if(i == 0){// when the line is z and x axis
+                        colors.push(0, 0, 1, 0, 0, 1); // blue z-axis
+                        colors.push(1, 0, 0, 1, 0, 0); // red x-axis
+                    }else{
+                        colors.push(0.5, 0.5, 0.5, 0.5, 0.5, 0.5); // gray
+                        colors.push(0.5, 0.5, 0.5, 0.5, 0.5, 0.5); // gray
+                    }
+                }
+
+                vertices.push(0, -10, 0, 0, 10, 0); // y-axis
+                colors.push(0, 1, 0, 0, 1, 0); // green y-axis
+            }
+
+            return await get_vec_clr_renderer(vertices, colors, device, preferredFormat);
+        }
+
+        async function get_vec_clr_renderer(vertices, colors, device, preferredFormat){
+
+            const vertexBuffer = device.createBuffer({
+                label: "axis vertices",
+                size: vertices.length * Float32Array.BYTES_PER_ELEMENT,
+                usage: GPUBufferUsage.VERTEX,
+                mappedAtCreation: true,
+            });
+
+            new Float32Array(vertexBuffer.getMappedRange()).set(vertices);
+            vertexBuffer.unmap();
+
+            const colorBuffer = device.createBuffer({
+                label: "axis colors",
+                size: colors.length * Float32Array.BYTES_PER_ELEMENT,
+                usage: GPUBufferUsage.VERTEX,
+                mappedAtCreation: true,
+            });
+            
+            new Float32Array(colorBuffer.getMappedRange()).set(colors);
+            colorBuffer.unmap();
+
+            const mvpBuffer = device.createBuffer({
+                label: "MVP",
+                size: 4*4*4,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+            
+            const src_shaders = `
+                struct VertexOut {
+                    @builtin(position) position: vec4f,
+                    @location(2) color: vec3f
+                };
+
+                struct Matrices {
+                    MVP: mat4x4f,
+                };
+
+                @group(${id_group}) @binding(${binding_matrices}) var<uniform> matrices:Matrices;
+
+                @vertex fn main_vert(@location(0) position: vec3f, @location(1) color: vec3f) -> VertexOut {
+                    var result: VertexOut;
+                    result.position = matrices.MVP * vec4f(position, 1);
+                    result.color = color;
+                    return result;
+                }
+
+                @fragment fn main_frag(@location(2) color: vec3f) -> @location(0) vec4f {
+                    return vec4f(color, 1);
+                }
+            `;
+            const shaderModule = device.createShaderModule({
+                label: "axis shader",
+                code:src_shaders,
+            });
+
+            const pipeline = device.createRenderPipeline({
+                label: "axis redering pipeline",
+                layout: "auto",
+                vertex: {
+                    module:shaderModule,
+                    entryPoint: "main_vert",
+                    buffers: [{
+                        arrayStride: 3 * Float32Array.BYTES_PER_ELEMENT,
+                        attributes: [{
+                            shaderLocation: 0,
+                            offset: 0,
+                            format: "float32x3",
+                        },],
+                    },{
+                        arrayStride: 3 * Float32Array.BYTES_PER_ELEMENT,
+                        attributes: [{
+                            shaderLocation: 1,
+                            offset: 0,
+                            format: "float32x3",
+                        },],
+                    }],
+                },
+                fragment: {
+                    module:shaderModule,
+                    entryPoint: "main_frag",
+                    targets: [{
+                        format: preferredFormat,
+                    }],
+                },
+                primitive: {
+                    topology: "line-list",
+                },
+                depthStencil: {
+                    depthWriteEnabled: true,
+                    depthCompare: "less",
+                    format: format_depth_texture,
+                },
+            });
+
+            const bindGroup = device.createBindGroup({
+                layout: pipeline.getBindGroupLayout(id_group),
+                entries: [
+                    { binding: binding_matrices, resource: {buffer: mvpBuffer} },
+                ],
+            });
+
+            function render(renderPass, MVP) {
+                renderPass.setPipeline(pipeline);
+                renderPass.setBindGroup(id_group, bindGroup);
+                renderPass.setVertexBuffer(0, vertexBuffer);
+                renderPass.setVertexBuffer(1, colorBuffer);
+                device.queue.writeBuffer(mvpBuffer, 0, MVP);
+                renderPass.draw(vertices.length / 3);
+            }
+
+            return { render };
+        }
+        
+        // https://github.com/g-truc/glm/blob/master/glm/ext/matrix_projection.inl
+        function project(p_obj, MVP, viewport)
+        {
+            let tmp = vec4.transformMat4(p_obj, MVP);
+            tmp = tmp.map((x) => x/tmp[3]); // tmp /= tmp[3]
+            for(let i=0 ; i<2 ; i++) {
+                tmp[i] = (0.5*tmp[i] + 0.5) * viewport[i+2] + viewport[i];
+            }
+            return tmp;
+        }
+        
+        // https://github.com/g-truc/glm/blob/master/glm/ext/matrix_projection.inl
+        function unproject(p_win, MVP, viewport) {
+            let MVP_inv = mat4.invert(MVP);
+            let tmp = mat4.clone(p_win);
+        
+            for (let i = 0; i < 2; i++)
+                tmp[i] = 2.0 * (tmp[i] - viewport[i]) / viewport[i+2] - 1.0;
+        
+            let p_obj = vec4.transformMat4(tmp, MVP_inv);
+        
+            p_obj = p_obj.map((x) => x/p_obj[3]);
+        
+            return p_obj;
+        }
+
+        function unproject_vector(vec_win, MVP, viewport)
+        {
+            let org_win = project([0,0,0,1], MVP, viewport);
+            let vec = unproject([org_win[0]+vec_win[0], org_win[1]+vec_win[1], org_win[2]+vec_win[2], 1],
+                                MVP, viewport);
+            return vec;
+        }
+
+
+
+
+        main();
+    </script>
+
+    <table align="center">
+        <tbody>
+            <tr><td>
+                <div align="center">
+                    <canvas id="webgpu" width="800," height="500"></canvas>
+                </div>
+            </td></tr>
+            <tr><td>
+                <ul>
+                    <li>rotation: dragging with left mouse button</li>
+                    <li>moving forward/backward: mouse wheel</li>
+                    <li>translation (left/right/up/down): dragging with middle mouse button</li>
+                    <li>moving tank: arrow keys</li>
+                    <li>moving turret: a, d</li>
+                    <li>moving barrel: w, s</li>
+                    <li>shooting: p</li>
+                </ul>
+            </td></tr>
+        </tbody>
+    </table>
+
+
+
+</body></html>
