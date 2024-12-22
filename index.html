@@ -46,6 +46,9 @@
         const url_tank  = "/resource/tank.glb";
         const url_shell = "/resource/88mm_shell.glb";
 
+        const LIGHT_DIRECTION = [0.5, 0.5, 0.5];
+        const LIGHT_INTENSITY = 1.0;
+
         const TANK = {
             obj: undefined,
             renderer: undefined,
@@ -169,7 +172,7 @@
                 };
                 static update_VP() {
                     UI.matrices.VP = mat4.multiply(mat4.translate(UI.matrices.P, UI.camera.position),UI.matrices.R);
-                }
+                };
                 static async onkeydown(event){
                     document.getElementById("what-key").textContent = `The key "${event.key}" is down.`;
                     switch(event.key) {
@@ -286,9 +289,9 @@
                 });
 
                 tank_axis_renderer.render(renderPass, mat4.multiply(UI.matrices.VP, mat4.translate(TANK.M, [0, -0.5, 0])));
-                TANK.renderer.render( renderPass, UI.matrices.VP, TANK.M, UI.camera.position );
-                TURRET.renderer.render( renderPass, UI.matrices.VP, TURRET.M, UI.camera.position );
-                BARREL.renderer.render( renderPass, UI.matrices.VP, BARREL.M, UI.camera.position );
+                TANK.renderer.render( renderPass,  UI.matrices.VP, TANK.M, UI.camera.position );
+                TURRET.renderer.render(renderPass, UI.matrices.VP, TURRET.M, UI.camera.position);
+                BARREL.renderer.render(renderPass, UI.matrices.VP, BARREL.M, UI.camera.position);
 
                 // render shell
                 {
@@ -414,7 +417,7 @@
             const sampler = device.createSampler({ magFilter:"linear", minFilter:"linear",});
             
             const uniformBuffer = device.createBuffer({
-                size: 2*4*4*4,
+                size: 3*4*4*4,
                 usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
             });
 
@@ -437,8 +440,8 @@
             };
 
             struct Matrices {
-                VP: mat4x4f,
-                M: mat4x4f,
+                PV: mat4x4f,
+                M: mat4x4f
             };
 
             struct Camera {
@@ -446,8 +449,8 @@
                 padding: f32,
             };
 
-            const light_direction:vec3<f32> = vec3<f32>(1, 1, 1);
-            const light_intensity:f32 = 1.0;
+            const light_direction:vec3<f32> = vec3<f32>(${LIGHT_DIRECTION[0]}, ${LIGHT_DIRECTION[1]}, ${LIGHT_DIRECTION[2]});
+            const light_intensity:f32 = ${LIGHT_INTENSITY};
 
             @group(${id_group}) @binding(${binding_matrices}) var<uniform> matrices:Matrices;
             @group(${id_group}) @binding(${binding_camera_position}) var<uniform> camera:Camera;
@@ -461,16 +464,18 @@
                 @location(${loc_normal}) normal: vec3f,
                 @location(${loc_position}) position: vec3f
                 )-> VertexOut {
-
+                
                 var vertex: VertexOut;
-                vertex.position = matrices.VP * matrices.M * vec4f(position, 1);
-                vertex.normal = normalize((matrices.M * vec4f(normal, 1)).xyz);
+
+                vertex.position = matrices.PV * matrices.M * vec4f(position, 1);
                 vertex.uv = uv;
                 vertex.pos = position;
 
+                vertex.normal = normalize((matrices.M * vec4f(normal, 0)).xyz);
                 vertex.light = normalize(light_direction);
 
-                vertex.view = normalize(camera.position - position.xyz);
+                let camera = matrices.PV * vec4f(camera.position, 1);
+                vertex.view = normalize(camera.xyz - position.xyz);
                 vertex.halfway = normalize(vertex.view + vertex.light);
 
                 return vertex;
@@ -484,22 +489,25 @@
                 @location(${loc_inter_stage_view}) view: vec3f
                 ) -> @location(0) vec4f {
 
-                // 1. perturbed normal
-                let norm = 2*(textureSample(normalTexture, my_sampler, uv).xyz - vec3f(.5));
-                let TBN = cotangent_frame(normal, -pos.xyz, uv);
-                let n = normalize(vec4(TBN*norm.xyz, 0)).xyz;
-                let perturbed_normal = 0.5*(n + vec3f(1));
-
-                // 2. compute the diffusive reflection color
+                // 1. textures
                 let diffusive_material = textureSample(diffuseTexture, my_sampler, uv).rgb;
                 let etc = textureSample(etcTexture, my_sampler, uv).rgb;
                 let ambient_occlusion = etc.r; // apply this to multiply to the computed diffusive reflection color
                 let roughness = etc.g; //assigned to the shininess property for the specular reflection color
                 let metalness = etc.b; // use it as specular reflection material property
 
+                // 2. perturbed normal
+                let norm = 2*(textureSample(normalTexture, my_sampler, uv).xyz - vec3f(.5));
+                let TBN = cotangent_frame(normal, -pos.xyz, uv);
+                let n = normalize(vec4(TBN*norm.xyz, 0)).xyz;
+                let perturbed_normal = 0.5*(n + vec3f(1));
+
+                // 3. diffusive reflection
                 let diffuse = diffusive_material * dot( light, perturbed_normal ) * light_intensity;
 
-                let _reflection = 2 * dot(light, perturbed_normal) * perturbed_normal - light;
+                // 4. specular reflection
+                let _reflection = 2 * dot(light, perturbed_normal) * perturbed_normal - light; // original
+                //let _reflection = perturbed_normal * halfway; // using halfway vector
                 let specular = metalness * pow(max(dot(_reflection, view), 0.0), roughness) * light_intensity;
 
                 let color = diffuse * ambient_occlusion + specular;
@@ -627,11 +635,11 @@
                 },
             });
 
-            function render(renderPass, VP, M, camera_position) {
+            function render(renderPass, PV, M, camera_position) {
                 renderPass.setPipeline(pipeline);
                 renderPass.setBindGroup(id_group, bindGroup);
 
-                device.queue.writeBuffer(uniformBuffer, 0, VP);
+                device.queue.writeBuffer(uniformBuffer, 0, PV);
                 device.queue.writeBuffer(uniformBuffer, 4*4*4, M);
 
                 device.queue.writeBuffer(
