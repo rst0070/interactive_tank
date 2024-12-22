@@ -43,8 +43,10 @@
 
         const format_depth_texture = 'depth24plus';
 
-        const url_tank  = "/resource/tank.glb";
-        const url_shell = "/resource/88mm_shell.glb";
+        const url_prefix = "https://rst0070.github.io/interactive_tank";
+
+        const url_tank  = `${url_prefix}/resource/tank.glb`;
+        const url_shell = `${url_prefix}/resource/88mm_shell.glb`;
 
         const LIGHT_DIRECTION = [0.5, 0.5, 0.5];
         const LIGHT_INTENSITY = 1.0;
@@ -77,14 +79,14 @@
         };
         const SHELLS = [];
         const TANK_TEXTURE = {
-            url_diffuse: "resource/textures/tank-color.jpg", 
-            url_etc: "resource/textures/tank-etc.png", 
-            url_normalmap: "resource/textures/tank-normal.png"
+            url_diffuse: `${url_prefix}/resource/textures/tank-color.jpg`, 
+            url_etc: `${url_prefix}/resource/textures/tank-etc.png`, 
+            url_normalmap: `${url_prefix}/resource/textures/tank-normal.png`
         };
         const SHELL_TEXTURE = {
-            url_diffuse: "resource/textures/shell-color.png", 
-            url_etc: "resource/textures/shell-etc.png", 
-            url_normalmap: "resource/textures/shell-normal.png" 
+            url_diffuse: `${url_prefix}/resource/textures/shell-color.png`, 
+            url_etc: `${url_prefix}/resource/textures/shell-etc.png`, 
+            url_normalmap: `${url_prefix}/resource/textures/shell-normal.png`
         }
 
         async function load_resources(device, preferredFormat) {
