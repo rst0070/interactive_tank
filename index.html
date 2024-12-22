@@ -171,7 +171,7 @@
                     UI.matrices.VP = mat4.multiply(mat4.translate(UI.matrices.P, UI.camera.position),UI.matrices.R);
                 }
                 static async onkeydown(event){
-                    console.log(event.key);
+                    document.getElementById("what-key").textContent = `The key "${event.key}" is down.`;
                     switch(event.key) {
                         case 'ArrowLeft':
                             TANK.rotation_y += 0.05;
@@ -201,7 +201,7 @@
                             BARREL.rotation_z -= 0.05;
                             BARREL.rotation_z = Math.max(-0.4, BARREL.rotation_z);
                             break;
-                        case 'p':
+                        case ' ':
                             UI.update_M();
 
                             let M = mat4.translate( BARREL.M, [ 0.5, 0.4, 0] );
@@ -291,22 +291,30 @@
                 BARREL.renderer.render( renderPass, UI.matrices.VP, BARREL.M, UI.camera.position );
 
                 // render shell
-                if(SHELLS.length > 0){
-                    for(let i = 0; i < SHELLS.length; i++){
+                {
 
-                        if(SHELLS[i].position[1] > 0){
-                            SHELLS[i].M = mat4.translate(SHELLS[i].M, [ 0.2, 5, 0]);
-                            SHELLS[i].M = mat4.rotate(SHELLS[i].M, [0, 0, 1], -0.004);
-                            SHELLS[i].position = mat4.multiply(SHELLS[i].M, [0, 0, 0, 1]);
-                        }
+                    let stack = [];
 
-                        SHELLS[i].renderer.render(
+                    while(SHELLS.length > 0){
+                        let shell = SHELLS.pop();
+                        if(shell.position[1] > 0){
+
+                            shell.M = mat4.translate(shell.M, [ 0.1, 2.5, 0]);
+                            shell.M = mat4.rotate(shell.M, [0, 0, 1], -0.002);
+                            shell.position = mat4.multiply(shell.M, [0, 0, 0, 1]);
+
+                            shell.renderer.render(
                                 renderPass,
                                 UI.matrices.VP,
-                                SHELLS[i].M,
+                                shell.M,
                                 UI.camera.position
                             );
+                            stack.push(shell);
+                        }
                     }
+
+                    SHELLS.push(...stack);
+                    
                 }
                 
 
@@ -491,12 +499,12 @@
 
                 let diffuse = diffusive_material * dot( light, perturbed_normal ) * light_intensity;
 
-                let reflection = 2 * dot(light, perturbed_normal) * perturbed_normal - light;
-                let specular = metalness * pow(max(dot(reflection, view), 0.0), roughness) * light_intensity;
+                let _reflection = 2 * dot(light, perturbed_normal) * perturbed_normal - light;
+                let specular = metalness * pow(max(dot(_reflection, view), 0.0), roughness) * light_intensity;
 
                 let color = diffuse * ambient_occlusion + specular;
 
-                return vec4(0.5 * (color), 1.0);
+                return vec4(color, 1.0);
             }
 
             fn cotangent_frame(N: vec3f, p: vec3f, uv: vec2f) -> mat3x3f {
@@ -846,6 +854,10 @@
                 </div>
             </td></tr>
             <tr><td>
+                <div align="center" id="what-key">
+                </div>
+            </td></tr>
+            <tr><td>
                 <ul>
                     <li>rotation: dragging with left mouse button</li>
                     <li>moving forward/backward: mouse wheel</li>
@@ -853,7 +865,7 @@
                     <li>moving tank: arrow keys</li>
                     <li>moving turret: a, d</li>
                     <li>moving barrel: w, s</li>
-                    <li>shooting: p</li>
+                    <li>shooting: spacebar</li>
                 </ul>
             </td></tr>
         </tbody>
